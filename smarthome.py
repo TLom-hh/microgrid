@@ -31,7 +31,7 @@ FEATURE_DOC = {
     "distractor":       "'n_distractors' observable signals with no effect"
 }
 
-SNAPSHOT = ("soc", "price", "solar", "load")
+SNAPSHOT = ("soc", "price", "solar", "load", "time", "season", "price_forecast", "solar_forecast")
 
 class SmartMicrogridEnv(gym.Env):
     metadata = {"render_modes": []}
