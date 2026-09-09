@@ -47,7 +47,7 @@ if __name__ == "__main__":
         df = pd.read_csv(sys.argv[2], index_col="time")
         df.index = pd.to_datetime(df.index, utc=True).tz_convert("Europe/Berlin")
     env = SmartMicrogridEnv(df=df)
-    seed = 3
+    seed = 1004
 
     plot_daily_profiles(env.df).savefig(out / "daily_profiles.png", dpi=130)
 
