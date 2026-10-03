@@ -5,6 +5,11 @@ Output columns:
     solar_kw    kW          PV output
     load_kw     kW          household load, OPSD household scaled to 'annual_kwh'
 
+Chronological split (no shuffling, half-open intervals in local time), see SPLITS:
+    train   2020-01-01 .. 2022-06-30   2.5 years, includes the start of the 2022 price crisis
+    val     2022-07-01 .. 2022-12-31   26 weeks, used for checkpoint selection and threshold tuning only
+    test    2023-01-01 .. 2023-12-31   52 weeks, all seasons, never touched before the final comparison
+Every script gets its data through load_dataset() + chronological_split() so the boundaries live here only.
 """
 
 from __future__ import annotations
@@ -15,6 +20,28 @@ import pandas as pd
 
 TIMEZONE = "Europe/Berlin"
 INPUT = Path("input")
+DATASET = Path("data/microgrid_hourly.csv")
+SPLITS = {"train": ("2020-01-01", "2022-07-01"),
+          "val": ("2022-07-01", "2023-01-01"),
+          "test": ("2023-01-01", "2024-01-02")}
+
+
+def load_dataset(path: Path | str = DATASET) -> pd.DataFrame:
+    """Processed hourly dataset with a tz-aware local-time index."""
+    df = pd.read_csv(path, index_col="time")
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert(TIMEZONE)
+    return df
+
+
+def chronological_split(df: pd.DataFrame, splits: dict[str, tuple[str, str]] = SPLITS) -> dict[str, pd.DataFrame]:
+    """Slice df into the half-open [start, end) windows of 'splits'. An env built on one slice can
+    never read rows of another (episode starts and forecasts are taken from the slice), so there is
+    no leakage of future prices or weather into training."""
+    out = {}
+    for name, (a, b) in splits.items():
+        a, b = pd.Timestamp(a, tz=TIMEZONE), pd.Timestamp(b, tz=TIMEZONE)
+        out[name] = df[(df.index >= a) & (df.index < b)]
+    return out
 SMARD_FILE = INPUT / "Gro_handelspreise_202001010000_202601010000_Viertelstunde.csv"
 PVGIS_FILE = INPUT / "Timeseries_53.036_10.290_SA3_35deg_0deg_2005_2023.csv"
 OPSD_FILE = INPUT / "household_data_15min_singleindex_filtered (2).csv"

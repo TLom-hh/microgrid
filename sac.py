@@ -1,13 +1,30 @@
-"""Running Soft Actor-Critic on the microgrid environment"""
+"""Soft Actor-Critic on the microgrid environment.
 
-import copy
-import sys
+Training reward (training_env.py): the battery's hourly saving relative to an idle battery, minus a small
+penalty per infeasible kWh requested. Evaluation reports the plain environment cost, so numbers stay
+comparable with the baselines and the oracle. The critic target has no terminal masking: the week's time
+limit is not an end of the task, the battery keeps its value.
+
+Data protocol (data.py / evaluation.py): training episodes come from the train split (2020-01 .. 2022-06),
+the periodic eval and the 'best' checkpoint use the validation weeks (2022-07 .. 2022-12), and the final
+table is one continuous run over the test year 2023 next to the baselines and the LP oracle.
+
+usage: 'python sac.py [OUT_DIR] [DATA_CSV] [--action-mode power|target_soc|residual] [--clip-penalty 0.05] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sac]'
+
+Writes OUT_DIR/<tag>_best.pt (best validation return), <tag>_final.pt, <tag>_log.csv, <tag>_training.png, <tag>_test_continuous.csv (test-year table) and four example week plots.
+"""
+
+import copy, argparse
 from pathlib import Path
 import numpy as np
+import pandas as pd
 from matplotlib import pyplot as plt
 from plotting import plot_episode
-from smarthome import SmartMicrogridEnv
-from smarthome_agents import make_rule_based
+from data import load_dataset, chronological_split, DATASET
+from evaluation import validation_return, actor_policy
+from baselines import make_rule_based
+from scenario import make_env
+from training_env import TrainingReward
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,7 +89,7 @@ def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alp
     with torch.no_grad():
         a2, logp_a2 = actor(o2)
         q_t = torch.min(q1_targ(o2, a2), q2_targ(o2, a2))
-        y = r + gamma * (1 - d) * (q_t - alpha * logp_a2)
+        y = r + gamma * (q_t - alpha * logp_a2)
     loss_q = F.mse_loss(q1(o, a), y) + F.mse_loss(q2(o, a), y)
     q_opt.zero_grad(); loss_q.backward(); q_opt.step()
 
@@ -90,26 +107,10 @@ def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alp
     return {"loss_q": loss_q.item(), "loss_pi": loss_pi.item(), "alpha": alpha.item()}
 
 
-def evaluate(env, actor, seed=None, n_episodes=5):
-    returns = []
-    for i in range(n_episodes):
-        if seed is None: 
-            obs, _ = env.reset(seed=1000 + i)
-        else:
-            obs, _ = env.reset(seed=seed)
-        done, ep_ret = False, 0.0
-        while not done:
-            with torch.no_grad():
-                a, _ = actor(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0),
-                            deterministic=True)
-            obs, r, term, trunc, _ = env.step(a.numpy().reshape(-1))
-            ep_ret += r
-            done = term or trunc
-        returns.append(ep_ret)
-    return float(np.mean(returns))
+def evaluate(env, actor):
+    return validation_return(env, actor_policy(actor))
 
-
-def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval_every=5_000):
+def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval_every=5_000, save_path=None, seed=0):
     obs_dim = env.observation_space.shape[0]
     actor = Actor(obs_dim, 1)
     q1, q2 = QNet(obs_dim, 1), QNet(obs_dim, 1)
@@ -123,20 +124,20 @@ def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval
     buffer = ReplayBuffer(obs_dim, 1, size=200_000)
 
     log, losses = [], {}
-    obs, _ = env.reset(seed=0)
+    obs, _ = env.reset(seed=seed)
     rule_pol = make_rule_based(env)
-    best = 0.0;
+    best = -np.inf;
     for step in range(total_steps):
         if step < warmup // 2:
-            a = np.clip(rule_pol(env) +  + np.random.normal(0.0, 0.1, size=1), -1.0, 1.0)
+            a = np.clip(rule_pol(env) + np.random.normal(0.0, 0.1, size=1), -1.0, 1.0)
         elif step < warmup:
             a = env.action_space.sample()
         else:
             with torch.no_grad():
                 a_t, _ = actor(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
             a = a_t.numpy().reshape(-1)
-        obs2, rew, term, trunc, _ = env.step(a)
-        buffer.store(obs, a, rew * REWARD_SCALE, obs2, float(term))
+        obs2, r, term, trunc, _ = env.step(a)                    # r: saving minus clip penalty (training_env.py)
+        buffer.store(obs, a, r * REWARD_SCALE, obs2, 0.0)        # done is always 0: continuing task, no terminal masking
         obs = env.reset()[0] if (term or trunc) else obs2
 
         if step >= warmup:
@@ -145,39 +146,61 @@ def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval
             ret = evaluate(eval_env, actor)
             print(f"step {step:>7d} eval return {ret:8.2f} {losses}")
             log.append((step, ret))
-            if ret > best: best = ret; torch.save(actor.state_dict(), out / "sac_actor.pt")
+            if ret > best:
+                best = ret
+                if save_path is not None:
+                    torch.save(actor.state_dict(), save_path)
     return actor, log
 
 if __name__ == "__main__":
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-    out.mkdir(parents=True, exist_ok=True)
-    df = None
-    if len(sys.argv) > 2:
-        import pandas as pd
-        df = pd.read_csv(sys.argv[2], index_col="time")
-        df.index = pd.to_datetime(df.index, utc=True).tz_convert("Europe/Berlin")
-    obs = ("soc", "price", "solar", "load", "time", "season")
-    env, eval_env = SmartMicrogridEnv(df=df), SmartMicrogridEnv(df=df)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("out", nargs="?", default="runs/sac")
+    p.add_argument("data", nargs="?", default=str(DATASET))
+    p.add_argument("--action-mode", default="power", choices=["power", "target_soc", "residual"])
+    p.add_argument("--clip-penalty", type=float, default=0.05, help="EUR per infeasible kWh requested, training reward only")
+    p.add_argument("--steps", type=int, default=100_000)
+    p.add_argument("--warmup", type=int, default=25_000)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--tag", default="sac")
+    args = p.parse_args()
 
-    actor, log = train(env, eval_env, total_steps=200_000, warmup=25_000)
-    torch.save(actor.state_dict(), out / "sac_actor_finish.pt")
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    splits = chronological_split(load_dataset(args.data))
+    env = TrainingReward(make_env(splits["train"], action_mode=args.action_mode), clip_penalty=args.clip_penalty)
+    eval_env = make_env(splits["val"], action_mode=args.action_mode)       # checkpoint selection: validation weeks
+
+    best_path = out / f"{args.tag}_best.pt"
+    actor, log = train(env, eval_env, total_steps=args.steps, warmup=args.warmup, save_path=best_path, seed=args.seed)
+    torch.save(actor.state_dict(), out / f"{args.tag}_final.pt")
+    pd.DataFrame(log, columns=["step", "validation_return"]).to_csv(out / f"{args.tag}_log.csv", index=False)
 
     # training curve
     steps, rets = zip(*log)
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(steps, rets)
-    ax.set_xlabel("env steps"); ax.set_ylabel("eval return (EUR/week)")
-    fig.savefig(out / "sac_training.png", dpi=130)
+    ax.set_xlabel("env steps"); ax.set_ylabel("validation return (EUR/week)")
+    fig.savefig(out / f"{args.tag}_training.png", dpi=130)
     plt.close(fig)
 
-    actor = Actor(env.observation_space.shape[0], 1)
-    actor.load_state_dict(torch.load("plots/sac_actor.pt"))
-    # one deterministic episode
-    seed = 1004
-    evaluate(eval_env, actor, seed, n_episodes=1)
-    hist = eval_env.history_frame()
-    total = (hist["cost"] + hist["degradation"]).sum()
-    fig = plot_episode(hist, f"SAC: {hist.index[0]:%d %b} – {hist.index[-1]:%d %b %Y}, total {total:.2f} EUR")
-    fig.savefig(out / "episode_sac.png", dpi=130)
-    plt.close(fig)
-    print(f"SAC cost {total:7.2f} EUR   clipped steps {int(hist['clipped'].sum()):3d}/{len(hist)}")
+    # final comparison on the test split: one continuous run over 2023, SoC carried across weeks (evaluation.py)
+    from evaluation import compare, report, policy_entry, oracle_entry, baseline_entries, run_episode
+    test_env = make_env(splits["test"])
+    test_env_actor = test_env if args.action_mode == "power" else make_env(splits["test"], action_mode=args.action_mode)
+    best = Actor(env.observation_space.shape[0], 1)
+    best.load_state_dict(torch.load(best_path))
+    entries = baseline_entries(test_env, splits)
+    entries["SAC (final)"] = policy_entry(test_env_actor, actor_policy(actor))
+    entries["SAC (best on val)"] = policy_entry(test_env_actor, actor_policy(best))
+    entries["oracle (cyclic)"] = oracle_entry(test_env, cyclic=True)
+    res = compare(entries, "continuous")
+    report(res, list(entries))
+    res.to_csv(out / f"{args.tag}_test_continuous.csv", index=False)
+
+    for start in test_env_actor.episode_starts()[::13]:                          # four example weeks, one per season
+        hist = run_episode(test_env_actor, actor_policy(best), start)
+        total = (hist["cost"] + hist["degradation"]).sum()
+        fig = plot_episode(hist, f"SAC: {hist.index[0]:%d %b} – {hist.index[-1]:%d %b %Y}, total {total:.2f} EUR")
+        fig.savefig(out / f"{args.tag}_episode_{hist.index[0]:%Y%m%d}.png", dpi=130)
+        plt.close(fig)
+        print(f"SAC week {hist.index[0]:%Y-%m-%d} cost {total:7.2f} EUR   clipped steps {int(hist['clipped'].sum()):3d}/{len(hist)}")

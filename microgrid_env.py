@@ -1,7 +1,11 @@
 """Smart Microgrid Environment: a home battery under dynamic prices and PV.
 
-Action: one continuous scalar a in [-1, 1] -> battery power setpoint a * max_power_kw
-    a > 0 charges the battery, a < 0 discharges it
+Action: one continuous scalar a in [-1, 1]; its meaning depends on 'action_mode':
+    power       battery power setpoint a * max_power_kw (default)
+    target_soc  a -> target SoC (a + 1) / 2; the env applies the grid-side power that reaches it this step
+    residual    battery_kw = (solar - load) + a * max_power_kw; a = 0 is pure self-consumption
+    a > 0 charges the battery, a < 0 discharges it (in 'power' and 'residual')
+    kw_to_action(kw) is the inverse map, used by the scripted baselines and the oracle replay
     agent never chooses where energy goes
     grid balances what is left: grid_kw = load_kw - solar_kw + battery_kw
     grid_kw > 0 -> buying at spot_price
@@ -32,6 +36,7 @@ FEATURE_DOC = {
 }
 
 SNAPSHOT = ("soc", "price", "solar", "load", "time", "season", "price_forecast", "solar_forecast")
+ACTION_MODES = ("power", "target_soc", "residual")
 
 class SmartMicrogridEnv(gym.Env):
     metadata = {"render_modes": []}
@@ -43,6 +48,7 @@ class SmartMicrogridEnv(gym.Env):
             forecast_horizon: int = 24,
             n_distractors: int = 2,
             n_discrete_actions: int | None = None,
+            action_mode: str = "power",
             episode_hours: int = 24 * 7,
             capacity_kwh: float = 10.0,
             max_power_kw: float = 5.0,
@@ -61,6 +67,7 @@ class SmartMicrogridEnv(gym.Env):
         self.forecast_horizon = forecast_horizon
         self.n_distractors = n_distractors
         self.episode_hours = episode_hours
+        self._hours = episode_hours
         self.dt = 1.0
         self.capacity_kwh = capacity_kwh
         self.max_power_kw = max_power_kw
@@ -83,6 +90,9 @@ class SmartMicrogridEnv(gym.Env):
 
         self._scales = {"price": 0.5, "solar": 5.0, "load": 5.0}
 
+        if action_mode not in ACTION_MODES:
+            raise ValueError(f"unknown action_mode {action_mode!r}; choose from {ACTION_MODES}")
+        self.action_mode = action_mode
         self.n_discrete_actions = n_discrete_actions
         if n_discrete_actions is None:
             self.action_space = spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
@@ -96,14 +106,44 @@ class SmartMicrogridEnv(gym.Env):
         self.history: list[dict] = []
 
     def reset(self, seed=None, options=None):
+        """options (all optional, for deterministic evaluation):
+            start_step     row index of the episode start (must be a midnight with room for the episode)
+            soc            initial state of charge instead of uniform(0.2, 0.8)
+            episode_hours  episode length for this episode only (e.g. a whole test split as one continuing run)
+        """
         super().reset(seed=seed)
-        self.start_step = int(self.np_random.choice(self._start_positions))
+        options = options or {}
+        self._hours = int(options.get("episode_hours", self.episode_hours))
+        needed = self._hours + self.forecast_horizon + 1
+        if "start_step" in options:
+            start = int(options["start_step"])
+            if self.df.index[start].hour != 0 or start + needed > len(self.df):
+                raise ValueError(f"start_step {start} is not a midnight with {needed} rows of data after it")
+        elif self._hours == self.episode_hours:
+            start = int(self.np_random.choice(self._start_positions))
+        else:
+            start = int(self.np_random.choice(self.episode_starts(stride_hours=24, episode_hours=self._hours)))
+        self.start_step = start
         self.current_step = self.start_step
-        self.soc = float(self.np_random.uniform(0.2, 0.8))
+        self.soc = float(options["soc"]) if "soc" in options else float(self.np_random.uniform(0.2, 0.8))
         self._distractor_state = self.np_random.normal(size=self.n_distractors)
         self._distractor_phase = self.np_random.uniform(0, 2 * np.pi, size=self.n_distractors)
         self.history = []
         return self._get_obs(), self._info()
+
+    def episode_starts(self, stride_hours: int | None = None, episode_hours: int | None = None) -> np.ndarray:
+        """Row indices of consecutive evaluation episodes: from the first midnight in the data, every
+        'stride_hours' (default: one episode length, i.e. non-overlapping), as long as an episode plus its
+        forecast horizon fits. Deterministic, so every policy is scored on exactly the same weeks."""
+        hours = self.episode_hours if episode_hours is None else int(episode_hours)
+        stride = hours if stride_hours is None else int(stride_hours)
+        midnights = np.flatnonzero(self.df.index.hour == 0)
+        if stride % 24 == 0:                     # calendar stride: stays on midnight across DST changes
+            cand = midnights[::stride // 24]
+        else:
+            cand = np.arange(midnights[0], len(self.df), stride)
+        needed = hours + self.forecast_horizon + 1   # an episode is exactly 'hours' steps, also across a DST change
+        return cand[cand + needed <= len(self.df)].astype(int)
 
     def step(self, action):
         row = self.df.iloc[self.current_step]
@@ -148,15 +188,34 @@ class SmartMicrogridEnv(gym.Env):
         self.current_step += 1
         self._advance_distractors()
         terminated = False
-        truncated = (self.current_step - self.start_step) >= self.episode_hours
+        truncated = (self.current_step - self.start_step) >= self._hours
         return self._get_obs(), float(reward), terminated, truncated, self._info()
 
     def _action_to_kw(self, action) -> float:
+        """Requested grid-side battery power for an action, before feasibility clipping."""
         if self.n_discrete_actions is None:
             a = float(np.clip(np.asarray(action, dtype=np.float64).reshape(-1)[0], -1.0, 1.0))
         else:
             a = float(self._discrete_levels[int(action)])
-        return a * self.max_power_kw
+        if self.action_mode == "power":
+            return a * self.max_power_kw
+        if self.action_mode == "residual":
+            row = self.df.iloc[self.current_step]
+            return (row["solar_kw"] - row["load_kw"]) + a * self.max_power_kw
+        delta_kwh = ((a + 1.0) / 2.0 - self.soc) * self.capacity_kwh          # target_soc
+        return delta_kwh / self.efficiency / self.dt if delta_kwh > 0 else delta_kwh * self.efficiency / self.dt
+
+    def kw_to_action(self, kw: float) -> np.ndarray:
+        """Inverse of _action_to_kw for the current state (continuous action space only), clipped to [-1, 1]."""
+        if self.action_mode == "power":
+            a = kw / self.max_power_kw
+        elif self.action_mode == "residual":
+            row = self.df.iloc[self.current_step]
+            a = (kw - (row["solar_kw"] - row["load_kw"])) / self.max_power_kw
+        else:
+            delta_kwh = kw * self.dt * self.efficiency if kw > 0 else kw * self.dt / self.efficiency
+            a = 2.0 * (self.soc + delta_kwh / self.capacity_kwh) - 1.0
+        return np.array([float(np.clip(a, -1.0, 1.0))])
 
     def _feasible_power(self, requested_kw: float) -> float:
         if requested_kw >= 0:
