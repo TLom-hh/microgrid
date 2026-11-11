@@ -9,7 +9,8 @@ Data protocol (data.py / evaluation.py): training episodes come from the train s
 the periodic eval and the 'best' checkpoint use the validation weeks (2022-07 .. 2022-12), and the final
 table is one continuous run over the test year 2023 next to the baselines and the LP oracle.
 
-usage: 'python sac.py [OUT_DIR] [DATA_CSV] [--action-mode power|target_soc|residual] [--clip-penalty 0.05] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sac]'
+usage: 'python sac.py [OUT_DIR] [DATA_CSV] [--household base|ev|hp|ev_hp] [--action-mode power|target_soc|residual] [--clip-penalty 0.05] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sac] [--threads 1]'
+Several seeds with mean ± std across them: experiments/seeds.py.
 
 Writes OUT_DIR/<tag>_best.pt (best validation return), <tag>_final.pt, <tag>_log.csv, <tag>_training.png, <tag>_test_continuous.csv (test-year table) and four example week plots.
 """
@@ -82,7 +83,7 @@ class Actor(nn.Module):
         logp -= (2 * (np.log(2) - u - F.softplus(-2 * u))).sum(-1)
         return a, logp
 
-def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alpha_opt, gamma=0.99, tau=0.005):
+def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alpha_opt, gamma=0.99, tau=0.005, target_entropy=-1.0):
     alpha = log_alpha.exp().detach()
     o, a, r, o2, d = (batch[k] for k in ("obs", "act", "rew", "obs2", "done"))
 
@@ -96,7 +97,7 @@ def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alp
     a_new, logp = actor(o)
     loss_pi = (alpha * logp - torch.min(q1(o, a_new), q2(o, a_new))).mean()
     pi_opt.zero_grad(); loss_pi.backward(); pi_opt.step()
-    loss_alpha = -(log_alpha * (logp.detach() - 1.0)).mean()
+    loss_alpha = -(log_alpha * (logp.detach() + target_entropy)).mean()
     alpha_opt.zero_grad(); loss_alpha.backward(); alpha_opt.step()
 
     with torch.no_grad():
@@ -111,9 +112,9 @@ def evaluate(env, actor):
     return validation_return(env, actor_policy(actor))
 
 def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval_every=5_000, save_path=None, seed=0):
-    obs_dim = env.observation_space.shape[0]
-    actor = Actor(obs_dim, 1)
-    q1, q2 = QNet(obs_dim, 1), QNet(obs_dim, 1)
+    obs_dim, act_dim = env.observation_space.shape[0], env.action_space.shape[0]
+    actor = Actor(obs_dim, act_dim)
+    q1, q2 = QNet(obs_dim, act_dim), QNet(obs_dim, act_dim)
     q1_targ, q2_targ = copy.deepcopy(q1), copy.deepcopy(q2)
     for p in itertools.chain(q1_targ.parameters(), q2_targ.parameters()):
         p.requires_grad = False
@@ -121,15 +122,16 @@ def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval
     pi_opt = torch.optim.Adam(actor.parameters(), lr=3e-4)
     log_alpha = torch.zeros(1, requires_grad=True)
     alpha_opt = torch.optim.Adam([log_alpha], lr=3e-4)
-    buffer = ReplayBuffer(obs_dim, 1, size=200_000)
+    buffer = ReplayBuffer(obs_dim, act_dim, size=200_000)
 
     log, losses = [], {}
     obs, _ = env.reset(seed=seed)
+    env.action_space.seed(seed)                                  # warmup samples come from the action space's own RNG
     rule_pol = make_rule_based(env)
     best = -np.inf;
     for step in range(total_steps):
         if step < warmup // 2:
-            a = np.clip(rule_pol(env) + np.random.normal(0.0, 0.1, size=1), -1.0, 1.0)
+            a = np.clip(rule_pol(env) + np.random.normal(0.0, 0.1, size=act_dim), -1.0, 1.0)
         elif step < warmup:
             a = env.action_space.sample()
         else:
@@ -141,7 +143,8 @@ def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval
         obs = env.reset()[0] if (term or trunc) else obs2
 
         if step >= warmup:
-            losses = update(buffer.sample(batch_size), actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alpha_opt)
+            losses = update(buffer.sample(batch_size), actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alpha_opt,
+                            target_entropy=-float(act_dim))
         if step % eval_every == 0:
             ret = evaluate(eval_env, actor)
             print(f"step {step:>7d} eval return {ret:8.2f} {losses}")
@@ -156,19 +159,24 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("out", nargs="?", default="runs/sac")
     p.add_argument("data", nargs="?", default=str(DATASET))
+    p.add_argument("--household", default="base", help="base | ev | hp | ev_hp (scenario.HOUSEHOLDS)")
     p.add_argument("--action-mode", default="power", choices=["power", "target_soc", "residual"])
     p.add_argument("--clip-penalty", type=float, default=0.05, help="EUR per infeasible kWh requested, training reward only")
     p.add_argument("--steps", type=int, default=100_000)
     p.add_argument("--warmup", type=int, default=25_000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tag", default="sac")
+    p.add_argument("--threads", type=int, default=0, help="torch CPU threads (0 = torch default); experiments/seeds.py sets 1 per parallel seed")
     args = p.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     splits = chronological_split(load_dataset(args.data))
-    env = TrainingReward(make_env(splits["train"], action_mode=args.action_mode), clip_penalty=args.clip_penalty)
-    eval_env = make_env(splits["val"], action_mode=args.action_mode)       # checkpoint selection: validation weeks
+    hh = args.household
+    env = TrainingReward(make_env(splits["train"], household=hh, action_mode=args.action_mode), clip_penalty=args.clip_penalty)
+    eval_env = make_env(splits["val"], household=hh, action_mode=args.action_mode)   # checkpoint selection: validation weeks
 
     best_path = out / f"{args.tag}_best.pt"
     actor, log = train(env, eval_env, total_steps=args.steps, warmup=args.warmup, save_path=best_path, seed=args.seed)
@@ -185,9 +193,9 @@ if __name__ == "__main__":
 
     # final comparison on the test split: one continuous run over 2023, SoC carried across weeks (evaluation.py)
     from evaluation import compare, report, policy_entry, oracle_entry, baseline_entries, run_episode
-    test_env = make_env(splits["test"])
-    test_env_actor = test_env if args.action_mode == "power" else make_env(splits["test"], action_mode=args.action_mode)
-    best = Actor(env.observation_space.shape[0], 1)
+    test_env = make_env(splits["test"], household=hh)
+    test_env_actor = test_env if args.action_mode == "power" else make_env(splits["test"], household=hh, action_mode=args.action_mode)
+    best = Actor(env.observation_space.shape[0], env.action_space.shape[0])
     best.load_state_dict(torch.load(best_path))
     entries = baseline_entries(test_env, splits)
     entries["SAC (final)"] = policy_entry(test_env_actor, actor_policy(actor))

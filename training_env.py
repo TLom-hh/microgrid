@@ -13,6 +13,10 @@ TrainingReward wraps a SmartMicrogridEnv and replaces the reward of step() by
                     gradient learner towards 'discharge'. Charging clip_penalty EUR per infeasible kWh
                     removes that bias; an optimal policy makes no infeasible requests, so it pays nothing.
 
+With an EV the env reward also holds the wallbox's energy cost and any public top-up at departure; they stay in
+the training reward. The subtracted no_battery_reward covers the house only (load incl. heat pump, minus PV),
+never the car, so it is still independent of the action.
+
 Evaluation never uses this wrapper: evaluation.py scores the plain env cost. The wrapped env's history and
 info["env_reward"] still hold the plain values.
 """

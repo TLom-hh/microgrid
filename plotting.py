@@ -9,6 +9,8 @@ C = {
     "soc": "#4a3aa7",     # violet
     "import": "#e34948",  # red  (diverging pole: buying)
     "export": "#2a78d6",  # blue (diverging pole: selling)
+    "ev": "#c2389a",      # magenta
+    "hp": "#8a5a2b",      # brown
     "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#9a9891", "surface": "#fcfcfb", "grid": "#e6e5e1",
 }
 
@@ -27,6 +29,8 @@ def plot_episode(hist, title: str = "Episode"):
 
     hist: DataFrame from SmartMicrogridEnv.history_frame() (index = timestamps).
     Panels: prices | solar & load | battery power | SoC | grid exchange | cumulative cost.
+    With a heat pump its share of the load is drawn dashed; with an EV the wallbox power and the car's SoC are
+    added to the battery and SoC panels, and the hours the car is away are shaded.
     """
     t = hist.index
     fig, axs = plt.subplots(6, 1, figsize=(12, 12), sharex=True)
@@ -41,18 +45,26 @@ def plot_episode(hist, title: str = "Episode"):
     ax = axs[1]
     ax.plot(t, hist["solar_kw"], color=C["solar"], lw=2, label="solar")
     ax.plot(t, hist["load_kw"], color=C["load"], lw=2, label="load")
+    if "hp_kw" in hist and hist["hp_kw"].any():
+        ax.plot(t, hist["hp_kw"], color=C["hp"], lw=1.5, ls="--", label="of which heat pump")
     _style(ax, "kW")
     ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
 
     ax = axs[2]
     ax.step(t, hist["requested_kw"], where="post", color=C["muted"], lw=1.5, ls="--", label="requested")
     ax.step(t, hist["battery_kw"], where="post", color=C["battery"], lw=2, label="actual")
+    if "ev_kw" in hist:
+        ax.step(t, hist["ev_kw"], where="post", color=C["ev"], lw=1.5, label="EV charging")
     ax.axhline(0, color=C["grid"], lw=1)
     _style(ax, "battery kW\n(+ charge)")
     ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
 
     ax = axs[3]
-    ax.plot(t, hist["soc"], color=C["soc"], lw=2)
+    ax.plot(t, hist["soc"], color=C["soc"], lw=2, label="battery")
+    if "ev_soc" in hist:
+        ax.plot(t, hist["ev_soc"], color=C["ev"], lw=1.5, label="EV")
+        ax.fill_between(t, 0, 1, where=~hist["ev_home"].values.astype(bool), step="post", color=C["muted"], alpha=0.15, lw=0, label="EV away")
+        ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=3)
     ax.set_ylim(0, 1)
     _style(ax, "SoC")
 

@@ -4,6 +4,7 @@ Output columns:
     spot_price  EUR/kWh     day-ahead price
     solar_kw    kW          PV output
     load_kw     kW          household load, OPSD household scaled to 'annual_kwh'
+    temp_c      °C          outdoor air temperature at 2 m (PVGIS T2m), drives the heat pump model in devices.py
 
 Chronological split (no shuffling, half-open intervals in local time), see SPLITS:
     train   2020-01-01 .. 2022-06-30   2.5 years, includes the start of the 2022 price crisis
@@ -79,16 +80,25 @@ def load_pvgis(path: Path = PVGIS_FILE, peak_kwp: float = 10.0, system_loss: flo
         P_ac = P_dc * (1 - system_loss)
     """
 
+    df = read_pvgis(path)
+    g, temp = df["G(i)"].values, df["T2m"].values
+    t_cell = temp + (noct - 20.0) / 800 * g
+    p_ac = peak_kwp * g / 1000.0 * (1 + gamma * (t_cell - 25.0)) * (1 - system_loss)
+    return pd.Series(np.clip(p_ac, 0 , None), index=df.index, name="solar_kw")
+
+def load_pvgis_temperature(path: Path = PVGIS_FILE) -> pd.Series:
+    """Outdoor air temperature at 2 m (°C) from the same PVGIS file: the heat pump's driver (devices.py)."""
+    return read_pvgis(path)["T2m"].rename("temp_c")
+
+def read_pvgis(path: Path = PVGIS_FILE) -> pd.DataFrame:
+    """The hourly table of a PVGIS time-series export, indexed by local time."""
     lines = path.read_text(encoding="utf-8").splitlines()
     start = next(i for i, l in enumerate(lines) if l.startswith("time,"))
     end = next(i for i, l in enumerate(lines) if i > start and not (l[:1].isdigit()))
     df = pd.read_csv(path, skiprows=start, nrows=end - start - 1)
     t = pd.to_datetime(df["time"], format="%Y%m%d:%H%M").dt.floor("h")
-    g, temp = df["G(i)"].values, df["T2m"].values
-    t_cell = temp + (noct - 20.0) / 800 * g
-    p_ac = peak_kwp * g / 1000.0 * (1 + gamma * (t_cell - 25.0)) * (1 - system_loss)
-    s = pd.Series(np.clip(p_ac, 0 , None), index=t.dt.tz_localize("UTC"), name="solar_kw")
-    return s.tz_convert(TIMEZONE)
+    df.index = pd.DatetimeIndex(t.dt.tz_localize("UTC")).tz_convert(TIMEZONE)
+    return df
 
 # OPSD household data
 def load_opsd_household(path: Path = OPSD_FILE, household: str = "residential5", annual_kwh: float | None = 4000.0) -> pd.Series:
@@ -143,13 +153,14 @@ def build_dataset(peak_kwp: float = 10.0, household: str = "residential5", annua
     """
 
     price, solar, load = load_smard(), load_pvgis(peak_kwp=peak_kwp), load_opsd_household(household=household, annual_kwh=annual_kwh)
+    temp = load_pvgis_temperature()
     series = [price, solar] if reuse_load else [price, solar, load]
     start = max(x.first_valid_index() for x in series)
     end = min(x.last_valid_index() for x in series)
     idx = pd.date_range(start, end, freq="1h", tz=TIMEZONE)
     if reuse_load:
         load = align_load_index(load, idx)
-    df = pd.concat([price.reindex(idx), solar.reindex(idx), load.reindex(idx)], axis=1)
+    df = pd.concat([price.reindex(idx), solar.reindex(idx), load.reindex(idx), temp.reindex(idx)], axis=1)
 
     report =  {}
     for c in df.columns:

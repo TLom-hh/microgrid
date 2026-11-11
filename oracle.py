@@ -15,6 +15,12 @@ lowest cost + degradation. Two solvers, both returning the same (total_cost, bat
 Two horizon variants: free end (battery may end empty; lower bound for the raw cost) and cyclic
 (end SoC >= start SoC; the fair ceiling for a continuing task).
 
+With an EV (env.ev, LP only): wallbox power while the car is home, the car's energy with the trip leaving at
+arrival, and at every departure a top-up to target_soc bought at the public price, exactly as in the env. Energy
+left in the car at the end is credited at ev.energy_value (and a car emptier than at the start is charged), the
+same end-of-horizon valuation evaluation.py applies to every policy; the returned total excludes that term so it
+matches the env replay.
+
 Every schedule is replayed through the Gymnasium env: the replayed cost must equal the solver's cost
 (run_oracle raises otherwise), which catches env/oracle physics mismatches.
 
@@ -31,8 +37,9 @@ LP_TOL = 1e-6
 
 
 def solve_schedule_lp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, efficiency, degradation_cost_per_kwh,
-                      cyclic=True, dt=1.0, solver="HIGHS"):
-    """Cost-optimal schedule by (MI)LP. net_kw is load - solar. Returns (total_cost, battery_kw, soc)."""
+                      cyclic=True, dt=1.0, solver="HIGHS", ev=None):
+    """Cost-optimal schedule by (MI)LP. net_kw is load - solar. Returns (total_cost, battery_kw, soc), and
+    with ev (dict from ev_inputs) also ev_kw as a fourth element."""
     import cvxpy as cp
     buy, sell, net_kw = (np.asarray(x, dtype=float) for x in (buy, sell, net_kw))
     T = len(buy)
@@ -41,18 +48,35 @@ def solve_schedule_lp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, effic
     e = cp.Variable(T + 1)                                                  # stored energy kWh
     cons = [e[0] == soc0 * capacity_kwh, e >= 0, e <= capacity_kwh,
             c <= max_power_kw, d <= max_power_kw,
-            e[1:] == e[:-1] + (c * efficiency - d / efficiency) * dt,
-            imp - exp == net_kw + c - d]
+            e[1:] == e[:-1] + (c * efficiency - d / efficiency) * dt]
+    cost_ev, terminal, ev_max = 0, 0, 0.0
+    if ev is not None:
+        ev_max = ev["max_kw"]
+        w = cp.Variable(T, nonneg=True)                                     # wallbox kW (grid side)
+        E = cp.Variable(T + 1)                                              # energy in the car, start of each hour
+        dep = np.flatnonzero(ev["departs_next"])
+        mid = E[:-1] + w * ev["eff"] * dt                                   # after this hour's charging
+        cons += [E[0] == ev["e0"], w <= ev_max * ev["home"], mid <= ev["cap"]]
+        if len(dep):
+            top = cp.Variable(len(dep), nonneg=True)                        # public top-up at each departure, kWh
+            topup = np.zeros((T, len(dep)))
+            topup[dep, np.arange(len(dep))] = 1.0
+            cons += [E[1:] == mid + topup @ top - ev["trip_next"], top >= ev["target"] * ev["cap"] - mid[dep]]
+            cost_ev = ev["public_price"] * cp.sum(top)
+        else:
+            cons.append(E[1:] == mid - ev["trip_next"])
+        terminal = ev["energy_value"] * (ev["e0"] - E[T])
+    cons.append(imp - exp == net_kw + c - d + (w if ev is not None else 0))
     if cyclic:
         cons.append(e[T] >= soc0 * capacity_kwh)
     bad = np.flatnonzero(buy < np.maximum(sell, 0.0) - 1e-12)              # hours where the relaxation is loose
     if len(bad):
-        big = np.abs(net_kw[bad]) + max_power_kw
+        big = np.abs(net_kw[bad]) + max_power_kw + ev_max
         zg, zb = cp.Variable(len(bad), boolean=True), cp.Variable(len(bad), boolean=True)
         cons += [imp[bad] <= cp.multiply(big, zg), exp[bad] <= cp.multiply(big, 1 - zg),
                  c[bad] <= max_power_kw * zb, d[bad] <= max_power_kw * (1 - zb)]
-    cost = dt * (buy @ imp - sell @ exp + degradation_cost_per_kwh * cp.sum(c + d))
-    prob = cp.Problem(cp.Minimize(cost), cons)
+    cost = dt * (buy @ imp - sell @ exp + degradation_cost_per_kwh * cp.sum(c + d)) + cost_ev
+    prob = cp.Problem(cp.Minimize(cost + terminal), cons)
     prob.solve(solver=solver)
     if prob.status != "optimal":
         raise RuntimeError(f"oracle LP status {prob.status}")
@@ -60,7 +84,10 @@ def solve_schedule_lp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, effic
     if overlap > 1e-4:
         raise RuntimeError(f"oracle LP relaxation is loose (simultaneous flows up to {overlap:.3g} kW)")
     battery_kw = np.where(c.value > d.value, c.value, -d.value)             # net, drop solver noise on the zero side
-    return float(prob.value), battery_kw, np.asarray(e.value[1:]) / capacity_kwh
+    if ev is None:
+        return float(prob.value), battery_kw, np.asarray(e.value[1:]) / capacity_kwh
+    total = float(cost.value)                                               # without the end-of-horizon credit
+    return total, battery_kw, np.asarray(e.value[1:]) / capacity_kwh, np.clip(w.value, 0.0, None)
 
 
 def solve_schedule_dp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, efficiency, degradation_cost_per_kwh,
@@ -99,30 +126,47 @@ def solve_schedule(*args, solver="lp", **kwargs):
     raise ValueError(f"unknown solver {solver!r}")
 
 
+def ev_inputs(env):
+    """The EV's data for the LP over the horizon the env was just reset to."""
+    a, b = env.start_step, env.start_step + env._hours
+    nxt = env.df.iloc[a + 1: b + 1]                                        # events happen at the start of the next hour
+    return dict(home=env.df["ev_home"].values[a:b].astype(float), departs_next=nxt["ev_departs"].values.astype(bool),
+                trip_next=nxt["ev_trip_kwh"].values, e0=env.ev_energy, cap=env.ev.capacity_kwh,
+                max_kw=env.ev.max_power_kw, eff=env.ev.efficiency, target=env.ev.target_soc,
+                public_price=env.ev.public_price, energy_value=env.ev.energy_value)
+
+
 def oracle(env, seed=None, options=None, cyclic=True, solver="lp"):
     """Solve the horizon that env.reset(seed, options) selects (see SmartMicrogridEnv.reset for options)."""
     env.reset(seed=seed, options=options)
     rows = env.df.iloc[env.start_step: env.start_step + env._hours]
-    total, battery_kw, soc = solve_schedule(
+    kwargs = {}
+    if env.ev:
+        if solver != "lp":
+            raise ValueError("the EV is only modelled in the LP oracle")
+        kwargs["ev"] = ev_inputs(env)
+    out = solve_schedule(
         rows["buy_price"].values, rows["sell_price"].values,
         (rows["load_kw"] - rows["solar_kw"]).values, env.soc,
         env.capacity_kwh, env.max_power_kw, env.efficiency, env.degradation_cost_per_kwh,
-        cyclic=cyclic, dt=env.dt, solver=solver)
-    return dict(total=total, battery_kw=battery_kw, soc=soc, soc_start=env.soc)
+        cyclic=cyclic, dt=env.dt, solver=solver, **kwargs)
+    total, battery_kw, soc = out[:3]
+    ev_kw = out[3] if env.ev else None
+    return dict(total=total, battery_kw=battery_kw, soc=soc, soc_start=env.soc, ev_kw=ev_kw)
 
 
-def replay(env, battery_kw, seed=None, options=None):
+def replay(env, battery_kw, seed=None, options=None, ev_kw=None):
     """Step the env through a fixed kW schedule (same reset as the oracle) and return its history frame."""
     env.reset(seed=seed, options=options)
-    for kw in battery_kw:
-        env.step(env.kw_to_action(kw))
+    for t, kw in enumerate(battery_kw):
+        env.step(env.kw_to_action(kw) if ev_kw is None else env.kw_to_action(kw, ev_kw[t]))
     return env.history_frame()
 
 
 def run_oracle(env, seed=None, cyclic=True, options=None, solver="lp", tol=1e-4):
     """Oracle schedule replayed through the env, with the solver-vs-env physics cross-check."""
     sol = oracle(env, seed, options, cyclic, solver)
-    hist = replay(env, sol["battery_kw"], seed, options)
+    hist = replay(env, sol["battery_kw"], seed, options, sol["ev_kw"])
     replayed = (hist["cost"] + hist["degradation"]).sum()
     if abs(replayed - sol["total"]) > tol:
         raise RuntimeError(f"oracle/env mismatch ({solver}, seed {seed}, options {options}): "
