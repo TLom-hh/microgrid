@@ -37,9 +37,13 @@ LP_TOL = 1e-6
 
 
 def solve_schedule_lp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, efficiency, degradation_cost_per_kwh,
-                      cyclic=True, dt=1.0, solver="HIGHS", ev=None):
+                      cyclic=True, dt=1.0, solver="HIGHS", ev=None, battery="free"):
     """Cost-optimal schedule by (MI)LP. net_kw is load - solar. Returns (total_cost, battery_kw, soc), and
-    with ev (dict from ev_inputs) also ev_kw as a fourth element."""
+    with ev (dict from ev_inputs) also ev_kw as a fourth element.
+    battery='free': the battery may do anything (grid charging, discharging into the car or the grid).
+    battery='self-consumption': it charges only from the house's PV surplus not taken by the car and discharges
+    only into the house's own deficit, as the solar-only rule does (control='ev' in the env). With a free car this
+    is the best any EV-only controller can reach; the solar-only rule is one schedule within the set."""
     import cvxpy as cp
     buy, sell, net_kw = (np.asarray(x, dtype=float) for x in (buy, sell, net_kw))
     T = len(buy)
@@ -67,6 +71,16 @@ def solve_schedule_lp(buy, sell, net_kw, soc0, capacity_kwh, max_power_kw, effic
             cons.append(E[1:] == mid - ev["trip_next"])
         terminal = ev["energy_value"] * (ev["e0"] - E[T])
     cons.append(imp - exp == net_kw + c - d + (w if ev is not None else 0))
+    if battery == "self-consumption":
+        surplus, deficit = np.maximum(-net_kw, 0.0), np.maximum(net_kw, 0.0)
+        cons.append(d <= deficit)
+        if ev is not None:
+            pv_car = cp.Variable(T, nonneg=True)                            # the part of the surplus the car takes
+            cons += [pv_car <= w, c + pv_car <= surplus]
+        else:
+            cons.append(c <= surplus)
+    elif battery != "free":
+        raise ValueError(f"battery must be 'free' or 'self-consumption', not {battery!r}")
     if cyclic:
         cons.append(e[T] >= soc0 * capacity_kwh)
     bad = np.flatnonzero(buy < np.maximum(sell, 0.0) - 1e-12)              # hours where the relaxation is loose
@@ -136,8 +150,11 @@ def ev_inputs(env):
                 public_price=env.ev.public_price, energy_value=env.ev.energy_value)
 
 
-def oracle(env, seed=None, options=None, cyclic=True, solver="lp"):
-    """Solve the horizon that env.reset(seed, options) selects (see SmartMicrogridEnv.reset for options)."""
+def oracle(env, seed=None, options=None, cyclic=True, solver="lp", battery="free"):
+    """Solve the horizon that env.reset(seed, options) selects (see SmartMicrogridEnv.reset for options).
+    The env must give the agent full control (the schedule is replayed as battery and wallbox kW)."""
+    if getattr(env, "control", "full") != "full":
+        raise ValueError("the oracle replays battery and wallbox kW: give it an env with control='full'")
     env.reset(seed=seed, options=options)
     rows = env.df.iloc[env.start_step: env.start_step + env._hours]
     kwargs = {}
@@ -145,6 +162,10 @@ def oracle(env, seed=None, options=None, cyclic=True, solver="lp"):
         if solver != "lp":
             raise ValueError("the EV is only modelled in the LP oracle")
         kwargs["ev"] = ev_inputs(env)
+    if battery != "free":
+        if solver != "lp":
+            raise ValueError("battery restrictions are only modelled in the LP oracle")
+        kwargs["battery"] = battery
     out = solve_schedule(
         rows["buy_price"].values, rows["sell_price"].values,
         (rows["load_kw"] - rows["solar_kw"]).values, env.soc,
@@ -163,9 +184,9 @@ def replay(env, battery_kw, seed=None, options=None, ev_kw=None):
     return env.history_frame()
 
 
-def run_oracle(env, seed=None, cyclic=True, options=None, solver="lp", tol=1e-4):
+def run_oracle(env, seed=None, cyclic=True, options=None, solver="lp", tol=1e-4, battery="free"):
     """Oracle schedule replayed through the env, with the solver-vs-env physics cross-check."""
-    sol = oracle(env, seed, options, cyclic, solver)
+    sol = oracle(env, seed, options, cyclic, solver, battery)
     hist = replay(env, sol["battery_kw"], seed, options, sol["ev_kw"])
     replayed = (hist["cost"] + hist["degradation"]).sum()
     if abs(replayed - sol["total"]) > tol:

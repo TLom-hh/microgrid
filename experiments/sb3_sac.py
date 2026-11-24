@@ -11,7 +11,7 @@ Differences that remain: SB3's warmup is uniform random actions (sac.py: half no
 SB3's internals (initialisation, the order of updates within a step).
 
 usage: python experiments/sb3_sac.py [OUT_DIR] [--household base|ev|hp|ev_hp] [--action-mode power|target_soc|residual]
-                                     [--clip-penalty 0.05] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sb3] [--threads 1]
+                                     [--clip-penalty 0.05] [--control full|ev] [--ev-shaping] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sb3] [--threads 1]
        several seeds: python experiments/seeds.py NAME --script experiments/sb3_sac.py -- --household ev_hp
 Writes the same files as sac.py: <tag>_log.csv, <tag>_best.zip, <tag>_final.zip, <tag>_test_continuous.csv.
 """
@@ -79,6 +79,9 @@ if __name__ == "__main__":
     p.add_argument("--household", default="base")
     p.add_argument("--action-mode", default="power", choices=["power", "target_soc", "residual"])
     p.add_argument("--clip-penalty", type=float, default=0.05)
+    p.add_argument("--control", default="full", choices=["full", "ev"],
+                   help="full: battery (+ wallbox); ev: wallbox only, battery on the solar-only rule, car parameters observed")
+    p.add_argument("--ev-shaping", action="store_true", help="potential-based shaping of the EV deadline (training_env.py)")
     p.add_argument("--steps", type=int, default=100_000)
     p.add_argument("--warmup", type=int, default=25_000)
     p.add_argument("--seed", type=int, default=0)
@@ -91,9 +94,9 @@ if __name__ == "__main__":
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     splits = chronological_split(load_dataset(args.data))
     hh = args.household
-    env = ScaleReward(TrainingReward(make_env(splits["train"], household=hh, action_mode=args.action_mode),
-                                     clip_penalty=args.clip_penalty), REWARD_SCALE)
-    eval_env = make_env(splits["val"], household=hh, action_mode=args.action_mode)
+    env = ScaleReward(TrainingReward(make_env(splits["train"], household=hh, action_mode=args.action_mode, control=args.control),
+                                     clip_penalty=args.clip_penalty, ev_shaping=args.ev_shaping, gamma=0.99), REWARD_SCALE)
+    eval_env = make_env(splits["val"], household=hh, action_mode=args.action_mode, control=args.control)
 
     model = SAC("MlpPolicy", env, buffer_size=200_000, learning_starts=args.warmup, seed=args.seed, device="cpu",
                 policy_kwargs=dict(net_arch=[256, 256]))
@@ -103,11 +106,14 @@ if __name__ == "__main__":
     pd.DataFrame(cb.log, columns=["step", "validation_return"]).to_csv(out / f"{args.tag}_log.csv", index=False)
 
     test_env = make_env(splits["test"], household=hh)
-    test_env_actor = test_env if args.action_mode == "power" else make_env(splits["test"], household=hh, action_mode=args.action_mode)
+    test_env_actor = test_env if (args.action_mode, args.control) == ("power", "full") else \
+        make_env(splits["test"], household=hh, action_mode=args.action_mode, control=args.control)
     best = SAC.load(out / f"{args.tag}_best", device="cpu")
     entries = baseline_entries(test_env, splits)
     entries["SB3 SAC (final)"] = policy_entry(test_env_actor, sb3_policy(model))
     entries["SB3 SAC (best on val)"] = policy_entry(test_env_actor, sb3_policy(best))
+    if args.control == "ev":
+        entries["oracle (EV only)"] = oracle_entry(test_env, cyclic=True, battery="self-consumption")
     entries["oracle (cyclic)"] = oracle_entry(test_env, cyclic=True)
     res = compare(entries, "continuous")
     report(res, list(entries))

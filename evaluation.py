@@ -18,9 +18,10 @@ so no policy profits from ending with an emptier car (e.g. charging after the ep
 
 usage: python evaluation.py [OUT_DIR] [name=actor.pt[:vpg] ...] [--data CSV] [--split test|val|train]
                             [--protocol continuous|weeks] [--action-mode power|target_soc|residual]
-                            [--household base|ev|hp|ev_hp]
-Baselines and the oracle run on the physical (power) interface; --action-mode is the interface the actor
-checkpoints were trained with. Writes OUT_DIR/eval_<split>_<protocol>.csv (one row per policy and week).
+                            [--household base|ev|hp|ev_hp] [--control full|ev]
+Baselines and the oracle run on the physical (power) interface with full control; --action-mode and --control are
+the interface the actor checkpoints were trained with. With an EV, 'oracle (EV only)' is added: the best schedule
+when the battery only does self-consumption (the ceiling for control='ev'). Writes OUT_DIR/eval_<split>_<protocol>.csv (one row per policy and week).
 """
 
 import argparse
@@ -133,12 +134,13 @@ def evaluate_continuous(env, policy, soc=EVAL_SOC):
     o = continuous_options(env, soc)
     return weekly_table(run_episode(env, policy, o["start_step"], o["soc"], o["episode_hours"]), env)
 
-def oracle_weeks(env, soc=EVAL_SOC, cyclic=True):
-    return pd.DataFrame([summarize(run_oracle(env, cyclic=cyclic, options={"start_step": int(s), "soc": soc, "ev_soc": EVAL_EV_SOC}), env)
+def oracle_weeks(env, soc=EVAL_SOC, cyclic=True, battery="free"):
+    return pd.DataFrame([summarize(run_oracle(env, cyclic=cyclic, options={"start_step": int(s), "soc": soc, "ev_soc": EVAL_EV_SOC},
+                                              battery=battery), env)
                          for s in env.episode_starts(episode_hours=WEEK)])
 
-def oracle_continuous(env, soc=EVAL_SOC, cyclic=True):
-    return weekly_table(run_oracle(env, cyclic=cyclic, options=continuous_options(env, soc)), env)
+def oracle_continuous(env, soc=EVAL_SOC, cyclic=True, battery="free"):
+    return weekly_table(run_oracle(env, cyclic=cyclic, options=continuous_options(env, soc), battery=battery), env)
 
 def validation_return(env, policy, soc=EVAL_SOC):
     """Mean plain env return (EUR/week, higher is better) over the weeks of env.df; for training-time evals."""
@@ -157,8 +159,9 @@ def tune_rule_based(env, ref_df, grid=RULE_GRID, soc=EVAL_SOC):
 def policy_entry(env, policy):
     return lambda protocol, soc: (evaluate_continuous if protocol == "continuous" else evaluate_weeks)(env, policy, soc)
 
-def oracle_entry(env, cyclic=True):
-    return lambda protocol, soc: (oracle_continuous if protocol == "continuous" else oracle_weeks)(env, soc, cyclic)
+def oracle_entry(env, cyclic=True, battery="free"):
+    """battery='self-consumption': 'oracle (EV only)', the best an agent with control='ev' can reach."""
+    return lambda protocol, soc: (oracle_continuous if protocol == "continuous" else oracle_weeks)(env, soc, cyclic, battery)
 
 def baseline_entries(env, splits, verbose=True):
     """The scripted rows of every comparison table, for an env on any split. 'rule-based' keeps the default
@@ -166,6 +169,9 @@ def baseline_entries(env, splits, verbose=True):
     picked on the validation split. Both take their price quantiles from the training split.
     All of them charge an EV immediately (the default wallbox); with an EV two smarter wallbox rules are
     added next to the best battery heuristic: '+ EV pv-surplus' and '+ EV cheapest' (baselines.py)."""
+    if getattr(env, "control", "full") != "full":
+        raise ValueError("baselines set the battery themselves: pass an env with control='full' (with the solar-only "
+                         "battery the EV rows behave exactly as they would under control='ev')")
     household = getattr(env, "household", "base")
     lo, hi, val_cost = tune_rule_based(make_env(splits["val"], household=household), splits["train"])
     if verbose:
@@ -230,19 +236,23 @@ if __name__ == "__main__":
     p.add_argument("--protocol", default="continuous", choices=["continuous", "weeks"])
     p.add_argument("--action-mode", default="power", choices=["power", "target_soc", "residual"])
     p.add_argument("--household", default="base", help="base | ev | hp | ev_hp (scenario.HOUSEHOLDS)")
+    p.add_argument("--control", default="full", choices=["full", "ev"], help="what the actor checkpoints control")
     args = p.parse_args()
 
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     splits = chronological_split(load_dataset(args.data))
     df = splits[args.split]
     env = make_env(df, household=args.household)
-    env_actor = env if args.action_mode == "power" else make_env(df, household=args.household, action_mode=args.action_mode)
+    env_actor = env if (args.action_mode, args.control) == ("power", "full") else \
+        make_env(df, household=args.household, action_mode=args.action_mode, control=args.control)
 
     entries = baseline_entries(env, splits)
     for arg in args.actors:
         name, path = arg.split("=", 1)
         entries[name] = policy_entry(env_actor, load_actor(path, env_actor))
     entries["oracle (free end)"] = oracle_entry(env, cyclic=False)
+    if env.ev:
+        entries["oracle (EV only)"] = oracle_entry(env, cyclic=True, battery="self-consumption")
     entries["oracle (cyclic)"] = oracle_entry(env, cyclic=True)
 
     res = compare(entries, args.protocol)

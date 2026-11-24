@@ -1,0 +1,57 @@
+# @package _global_
+# DreamerV3 on the microgrid (launched by dreamer.py). Recipe of sheeprl's DMC proprioceptive runs: model size S,
+# replay ratio 0.5 gradient steps per env step (train ratio 512 of DreamerV3 with batch 16 x 64), 4 envs.
+defaults:
+  - override /algo: dreamer_v3_S
+  - override /env: microgrid
+  - _self_
+
+seed: 0
+num_threads: 1
+
+algo:
+  total_steps: 100_000
+  per_rank_batch_size: 16
+  per_rank_sequence_length: 64
+  replay_ratio: 0.5
+  learning_starts: 1024
+  run_test: False         # scoring is done by dreamer.py through evaluation.py
+  cnn_keys:
+    encoder: []
+  mlp_keys:
+    encoder: [state]
+
+buffer:
+  size: 100_000           # the whole run
+  memmap: False
+  checkpoint: False       # checkpoints hold the models only (small); they are scored afterwards
+
+checkpoint:
+  every: 5000             # one checkpoint per 5k env steps, like sac.py's periodic validation
+  keep_last: 1000         # keep all of them: dreamer.py picks the best on the validation split
+  save_last: True
+
+metric:
+  log_every: 5000
+  aggregator:             # the world-model and actor-critic losses (as in sheeprl's exp/dreamer_v3.yaml)
+    metrics:
+      Loss/world_model_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/value_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/policy_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/observation_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/reward_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/state_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Loss/continue_loss: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      State/kl: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      State/post_entropy: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      State/prior_entropy: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Grads/world_model: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Grads/actor: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+      Grads/critic: {_target_: torchmetrics.MeanMetric, sync_on_compute: "${metric.sync_on_compute}"}
+
+fabric:
+  accelerator: cpu
+  precision: 32-true
+
+model_manager:
+  disabled: True

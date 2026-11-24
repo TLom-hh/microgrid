@@ -9,8 +9,11 @@ Data protocol (data.py / evaluation.py): training episodes come from the train s
 the periodic eval and the 'best' checkpoint use the validation weeks (2022-07 .. 2022-12), and the final
 table is one continuous run over the test year 2023 next to the baselines and the LP oracle.
 
-usage: 'python sac.py [OUT_DIR] [DATA_CSV] [--household base|ev|hp|ev_hp] [--action-mode power|target_soc|residual] [--clip-penalty 0.05] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sac] [--threads 1]'
+usage: 'python sac.py [OUT_DIR] [DATA_CSV] [--household base|ev|hp|ev_hp] [--action-mode power|target_soc|residual] [--clip-penalty 0.05] [--control full|ev] [--ev-shaping] [--houses fixed|gen] [--context observed|hidden] [--steps 100000] [--warmup 25000] [--seed 0] [--tag sac] [--threads 1]'
 Several seeds with mean ± std across them: experiments/seeds.py.
+--houses gen: generalization setting (houses.py): every training episode in one of 32 random houses, checkpoints
+selected on 6 validation houses, tested on 9 new houses (+ <tag>_test_ood_continuous.csv on 4 out-of-range houses);
+the test tables then have a 'house' column. --context hidden drops the car and house parameters from the obs.
 
 Writes OUT_DIR/<tag>_best.pt (best validation return), <tag>_final.pt, <tag>_log.csv, <tag>_training.png, <tag>_test_continuous.csv (test-year table) and four example week plots.
 """
@@ -109,6 +112,9 @@ def update(batch, actor, q1, q2, q1_targ, q2_targ, q_opt, pi_opt, log_alpha, alp
 
 
 def evaluate(env, actor):
+    if isinstance(env, (list, tuple)):                           # validation houses (houses.py)
+        from houses import validation_return as houses_validation_return
+        return houses_validation_return(env, actor_policy(actor))
     return validation_return(env, actor_policy(actor))
 
 def train(env, eval_env, total_steps=100_000, warmup=5_000, batch_size=256, eval_every=5_000, save_path=None, seed=0):
@@ -162,6 +168,13 @@ if __name__ == "__main__":
     p.add_argument("--household", default="base", help="base | ev | hp | ev_hp (scenario.HOUSEHOLDS)")
     p.add_argument("--action-mode", default="power", choices=["power", "target_soc", "residual"])
     p.add_argument("--clip-penalty", type=float, default=0.05, help="EUR per infeasible kWh requested, training reward only")
+    p.add_argument("--control", default="full", choices=["full", "ev"],
+                   help="full: battery (+ wallbox); ev: wallbox only, battery on the solar-only rule, car parameters observed")
+    p.add_argument("--ev-shaping", action="store_true", help="potential-based shaping of the EV deadline (training_env.py), gamma 0.99 as the critic")
+    p.add_argument("--houses", default="fixed", choices=["fixed", "gen"],
+                   help="fixed: the one --household house; gen: random houses (houses.py), tested on new houses")
+    p.add_argument("--context", default="observed", choices=["observed", "hidden"],
+                   help="with --houses gen: car and house parameters in the observation or not")
     p.add_argument("--steps", type=int, default=100_000)
     p.add_argument("--warmup", type=int, default=25_000)
     p.add_argument("--seed", type=int, default=0)
@@ -175,8 +188,15 @@ if __name__ == "__main__":
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     splits = chronological_split(load_dataset(args.data))
     hh = args.household
-    env = TrainingReward(make_env(splits["train"], household=hh, action_mode=args.action_mode), clip_penalty=args.clip_penalty)
-    eval_env = make_env(splits["val"], household=hh, action_mode=args.action_mode)   # checkpoint selection: validation weeks
+    if args.houses == "gen":
+        import houses
+        kw = dict(action_mode=args.action_mode, control=args.control, context=args.context)
+        train_env = houses.make_multi_env(splits["train"], "train", **kw)
+        eval_env = houses.make_envs(splits["val"], "val", **kw)                 # checkpoint selection: validation houses
+    else:
+        train_env = make_env(splits["train"], household=hh, action_mode=args.action_mode, control=args.control)
+        eval_env = make_env(splits["val"], household=hh, action_mode=args.action_mode, control=args.control)   # checkpoint selection: validation weeks
+    env = TrainingReward(train_env, clip_penalty=args.clip_penalty, ev_shaping=args.ev_shaping, gamma=0.99)
 
     best_path = out / f"{args.tag}_best.pt"
     actor, log = train(env, eval_env, total_steps=args.steps, warmup=args.warmup, save_path=best_path, seed=args.seed)
@@ -193,13 +213,23 @@ if __name__ == "__main__":
 
     # final comparison on the test split: one continuous run over 2023, SoC carried across weeks (evaluation.py)
     from evaluation import compare, report, policy_entry, oracle_entry, baseline_entries, run_episode
-    test_env = make_env(splits["test"], household=hh)
-    test_env_actor = test_env if args.action_mode == "power" else make_env(splits["test"], household=hh, action_mode=args.action_mode)
     best = Actor(env.observation_space.shape[0], env.action_space.shape[0])
     best.load_state_dict(torch.load(best_path))
+    if args.houses == "gen":
+        pols = {"SAC (final)": actor_policy(actor), "SAC (best on val)": actor_policy(best)}
+        for house_set, suffix in (("test", ""), ("ood", "_ood")):
+            res = houses.test_table(pols, house_set, splits, control=args.control, context=args.context)
+            houses.report(res, f"SAC, {house_set} houses, test year")
+            res.to_csv(out / f"{args.tag}_test{suffix}_continuous.csv", index=False)
+        raise SystemExit(0)
+    test_env = make_env(splits["test"], household=hh)
+    test_env_actor = test_env if (args.action_mode, args.control) == ("power", "full") else \
+        make_env(splits["test"], household=hh, action_mode=args.action_mode, control=args.control)
     entries = baseline_entries(test_env, splits)
     entries["SAC (final)"] = policy_entry(test_env_actor, actor_policy(actor))
     entries["SAC (best on val)"] = policy_entry(test_env_actor, actor_policy(best))
+    if args.control == "ev":
+        entries["oracle (EV only)"] = oracle_entry(test_env, cyclic=True, battery="self-consumption")
     entries["oracle (cyclic)"] = oracle_entry(test_env, cyclic=True)
     res = compare(entries, "continuous")
     report(res, list(entries))

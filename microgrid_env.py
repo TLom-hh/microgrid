@@ -43,10 +43,18 @@ FEATURE_DOC = {
     "distractor":       "'n_distractors' observable signals with no effect",
     "ev":               "EV plugged in (0/1), EV SoC, hours to the planned departure / 24 (capped at 1, 0 while away); zeros without an EV",
     "temperature":      "outdoor temperature / 20 °C (drives the heat pump load)",
+    "ev_context":       "the car's fixed parameters: battery kWh / 100, wallbox kW / 11, kWh per km / 0.2, target SoC "
+                        "(observed context, so one agent can serve different cars); zeros without an EV",
+    "house_context":    "the house's fixed parameters: PV kWp / 10, household kWh per year / 4000, battery kWh / 10, "
+                        "battery kW / 5, heat pump heat loss (kW/K) / 0.22 (0 without a heat pump); for one agent across houses (houses.py)",
 }
+
+REFERENCE_KWP = 10.0       # the PV size and household demand data.py builds the dataset with; pv_kwp and annual_kwh
+REFERENCE_KWH = 4000.0     # scale the solar and household load columns linearly relative to them
 
 SNAPSHOT = ("soc", "price", "solar", "load", "time", "season", "price_forecast", "solar_forecast")
 ACTION_MODES = ("power", "target_soc", "residual")
+CONTROLS = ("full", "ev")
 
 class SmartMicrogridEnv(gym.Env):
     metadata = {"render_modes": []}
@@ -70,13 +78,32 @@ class SmartMicrogridEnv(gym.Env):
             record_history: bool = True,
             heat_pump: dict | bool | None = None,
             ev: dict | bool | None = None,
+            control: str = "full",
+            pv_kwp: float = REFERENCE_KWP,
+            annual_kwh: float = REFERENCE_KWH,
     ):
-        """obs_features=None: SNAPSHOT, plus 'ev' with an EV and 'temperature' with a heat pump."""
+        """obs_features=None: SNAPSHOT, plus 'ev' with an EV, 'temperature' with a heat pump and 'ev_context'
+        with control='ev'.
+
+        control   'full': the agent sets the battery (and, with an EV, the wallbox): action (battery, ev).
+                  'ev':   the agent sets only the wallbox (1-D action); the battery follows the solar-only rule
+                          (baselines.py: store the PV surplus left after the car, cover the house's own deficit),
+                          clipped to what is feasible, so it never makes an infeasible request. action_mode does
+                          not apply (it is the battery's interface).
+        pv_kwp, annual_kwh  PV size and household demand (without heat pump) of this house: the dataset's solar and
+                  load columns are scaled linearly from the reference house (10 kWp, 4000 kWh/year; PV output is
+                  linear in kWp in data.load_pvgis). Defaults leave the data unchanged."""
         super().__init__()
         self.heat_pump = make_device(HeatPump, heat_pump)
         self.ev = make_device(EV, ev)
+        if control not in CONTROLS:
+            raise ValueError(f"unknown control {control!r}; choose from {CONTROLS}")
+        if control == "ev" and not self.ev:
+            raise ValueError("control='ev' needs a household with an EV")
+        self.control = control
         if obs_features is None:
-            obs_features = SNAPSHOT + (("ev",) if self.ev else ()) + (("temperature",) if self.heat_pump else ())
+            obs_features = (SNAPSHOT + (("ev",) if self.ev else ()) + (("temperature",) if self.heat_pump else ())
+                            + (("ev_context",) if control == "ev" else ()))
         unknown = set(obs_features) - set(FEATURE_DOC)
         if unknown:
             raise ValueError(f"unkown obs features {unknown}; choose from {list(FEATURE_DOC)}")
@@ -97,6 +124,11 @@ class SmartMicrogridEnv(gym.Env):
 
         self.df = df if df is not None else generate_dummy_data(days=365)
         self.df = self.df.copy()
+        self.pv_kwp, self.annual_kwh = float(pv_kwp), float(annual_kwh)
+        if self.pv_kwp != REFERENCE_KWP:
+            self.df["solar_kw"] = self.df["solar_kw"] * (self.pv_kwp / REFERENCE_KWP)
+        if self.annual_kwh != REFERENCE_KWH:
+            self.df["load_kw"] = self.df["load_kw"] * (self.annual_kwh / REFERENCE_KWH)
         self.df["household_kw"] = self.df["load_kw"]
         self.df["hp_kw"] = self.heat_pump.electric_kw(self.df["temp_c"]).values if self.heat_pump else 0.0
         self.df["load_kw"] = self.df["household_kw"] + self.df["hp_kw"]       # everything the agent cannot shift
@@ -118,7 +150,7 @@ class SmartMicrogridEnv(gym.Env):
         self.n_discrete_actions = n_discrete_actions
         if n_discrete_actions is not None and self.ev:
             raise ValueError("discrete actions are only implemented for the battery-only env")
-        self.action_dim = 2 if self.ev else 1
+        self.action_dim = 1 if control == "ev" else (2 if self.ev else 1)
         if n_discrete_actions is None:
             self.action_space = spaces.Box(-1.0, 1.0, shape=(self.action_dim,), dtype=np.float32)
         else:
@@ -247,10 +279,14 @@ class SmartMicrogridEnv(gym.Env):
         return a
 
     def _ev_request(self, a) -> float:
-        return float((a[1] + 1.0) / 2.0 * self.ev.max_power_kw) if self.ev else 0.0
+        return float((a[-1] + 1.0) / 2.0 * self.ev.max_power_kw) if self.ev else 0.0
 
     def _battery_request(self, a0: float, ev_kw: float = 0.0) -> float:
-        """Requested grid-side battery power for the battery part of an action, before feasibility clipping."""
+        """Requested grid-side battery power for the battery part of an action, before feasibility clipping.
+        With control='ev' the battery is not part of the action: the solar-only rule, already feasible."""
+        if self.control == "ev":
+            from baselines import _bat_solar_only
+            return self._feasible_power(_bat_solar_only(self, ev_kw))
         if self.action_mode == "power":
             return a0 * self.max_power_kw
         if self.action_mode == "residual":
@@ -266,7 +302,10 @@ class SmartMicrogridEnv(gym.Env):
 
     def kw_to_action(self, kw: float, ev_kw: float = 0.0) -> np.ndarray:
         """Inverse map for the current state (continuous action space only), clipped to [-1, 1]: battery kW
-        (and, with an EV, the requested wallbox kW) -> action."""
+        (and, with an EV, the requested wallbox kW) -> action. With control='ev' the battery kW is ignored."""
+        ev_a = float(np.clip(2.0 * ev_kw / self.ev.max_power_kw - 1.0, -1.0, 1.0)) if self.ev else None
+        if self.control == "ev":
+            return np.array([ev_a])
         if self.action_mode == "power":
             a = kw / self.max_power_kw
         elif self.action_mode == "residual":
@@ -277,7 +316,7 @@ class SmartMicrogridEnv(gym.Env):
             a = 2.0 * (self.soc + delta_kwh / self.capacity_kwh) - 1.0
         out = [float(np.clip(a, -1.0, 1.0))]
         if self.ev:
-            out.append(float(np.clip(2.0 * ev_kw / self.ev.max_power_kw - 1.0, -1.0, 1.0)))
+            out.append(ev_a)
         return np.array(out)
 
     def _feasible_ev(self, requested_kw: float) -> float:
@@ -318,6 +357,8 @@ class SmartMicrogridEnv(gym.Env):
             "distractor": self.n_distractors,
             "ev": 3,
             "temperature": 1,
+            "ev_context": 4,
+            "house_context": 5,
         }
         return sum(sizes[f] for f in self.obs_features)
 
@@ -361,6 +402,14 @@ class SmartMicrogridEnv(gym.Env):
                         blocks.append([0.0, 0.0, 0.0])
                 case "temperature":
                     blocks.append([row["temp_c"] / 20.0])
+                case "ev_context":
+                    car = self.ev
+                    blocks.append([car.capacity_kwh / 100.0, car.max_power_kw / 11.0, car.kwh_per_km / 0.2,
+                                   car.target_soc] if car else [0.0, 0.0, 0.0, 0.0])
+                case "house_context":
+                    hp = self.heat_pump.heat_loss_kw_per_k / 0.22 if self.heat_pump else 0.0
+                    blocks.append([self.pv_kwp / REFERENCE_KWP, self.annual_kwh / REFERENCE_KWH,
+                                   self.capacity_kwh / 10.0, self.max_power_kw / 5.0, hp])
         return np.concatenate(blocks).astype(np.float32)
 
     def _distractor_values(self) -> np.ndarray:

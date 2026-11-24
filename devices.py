@@ -24,8 +24,9 @@ Charging semantics (enforced by the env and the oracle alike):
     - the agent sets the wallbox power while the car is home (0 .. max_power_kw, grid side, efficiency on the way in)
     - at departure the car must hold target_soc; a shortfall is bought on the road at public_price (EUR/kWh) and
       tops the car up to target_soc (the user charged publicly). This turns the deadline into a cost.
-    - the trip's energy (km * kwh_per_km) leaves the car at arrival. target_soc * capacity >= max_km * kwh_per_km,
-      so the car never runs empty.
+    - the trip's energy (km * kwh_per_km) leaves the car at arrival. Trips are capped at the car's range from
+      target_soc (max_km is lowered to target_soc * capacity / kwh_per_km for a small car: its household does
+      not drive further on one charge), so the car never runs empty.
     - no vehicle-to-home: the EV only charges.
 The planned departure time is assumed known (the user enters it in the charging app); the arrival time and the
 trip energy are not known in advance: they are the unpredictable part.
@@ -100,8 +101,7 @@ class EV:
             self.weekday = Trips(**self.weekday)
         if isinstance(self.weekend, dict):
             self.weekend = Trips(**self.weekend)
-        if self.target_soc * self.capacity_kwh < self.max_km * self.kwh_per_km:
-            raise ValueError("target_soc * capacity must cover the longest trip (max_km * kwh_per_km)")
+        self.max_km = min(self.max_km, self.target_soc * self.capacity_kwh / self.kwh_per_km)   # range from target
 
     def trip(self, date: pd.Timestamp):
         """(departure hour, arrival hour, km) of the date, or None if the car stays home."""

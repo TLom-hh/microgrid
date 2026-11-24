@@ -15,6 +15,9 @@ Outputs, after all seeds have finished:
     results/seeds/NAME_summary.csv     mean, std (ddof 1), min, max over seeds per policy and metric;
                                        the scripted baselines and the oracle are deterministic and appear once
     figures/seeds_NAME_training.png    validation return vs env steps: mean ± std band and every seed
+    results/seeds/NAME_ood_*.csv       the same for <tag>_test_ood_continuous.csv, if the seeds wrote one
+                                       (--houses gen: out-of-range houses, houses.py)
+With --houses gen the test tables have a 'house' column; all metrics are then means over houses and weeks.
 
 Metrics per seed (test year, continuous protocol, EUR/week; lower is better, negative = net income from exports):
     total            mean weekly cost (cost + degradation)
@@ -22,6 +25,8 @@ Metrics per seed (test year, continuous protocol, EUR/week; lower is better, neg
     vs_best_heuristic  total minus the best scripted heuristic's (with an EV usually 'solar-only + EV cheapest')
     value_share      % of the battery's value (no battery -> cyclic oracle) the policy captures
     gap_closed       % of the rule-based -> cyclic oracle gap closed
+    ev_gap_closed    with an 'oracle (EV only)' row (control='ev'): % of the solar-only (immediate charging) ->
+                     EV-only oracle gap closed, i.e. of what any wallbox controller can gain
     plus the behaviour counters of evaluation.summarize (kWh/week).
 """
 
@@ -34,9 +39,10 @@ from matplotlib import pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTED = ("no battery", "dump", "rule-based", "rule-based (tuned)", "solar-only", "oracle (cyclic)", "oracle (free end)")
-is_scripted = lambda policy: policy in SCRIPTED or policy.startswith("solar-only + EV")      # EV heuristics (evaluation.py)
-BEHAVIOUR = ["solar_stored_kwh", "grid_charge_kwh", "discharged_to_export_kwh", "throughput_kwh", "clipped_steps"]
-METRICS = ["total", "vs_solar_only", "vs_best_heuristic", "value_share", "gap_closed"] + BEHAVIOUR
+is_scripted = lambda policy: policy in SCRIPTED or policy.startswith(("solar-only + EV", "oracle"))      # EV heuristics (evaluation.py)
+BEHAVIOUR = ["solar_stored_kwh", "grid_charge_kwh", "discharged_to_export_kwh", "throughput_kwh", "clipped_steps",
+             "ev_from_pv_kwh", "ev_public_kwh"]
+METRICS = ["total", "vs_solar_only", "vs_best_heuristic", "value_share", "gap_closed", "ev_gap_closed"] + BEHAVIOUR
 
 
 def run_seed(name, seed, script, extra, out_root):
@@ -62,14 +68,17 @@ def per_policy(table):
     m["vs_best_heuristic"] = t - t[[p for p in t.index if is_scripted(p) and not p.startswith("oracle")]].min()
     m["value_share"] = 100 * (t["no battery"] - t) / (t["no battery"] - t["oracle (cyclic)"])
     m["gap_closed"] = 100 * (t["rule-based"] - t) / (t["rule-based"] - t["oracle (cyclic)"])
+    if "oracle (EV only)" in t:
+        m["ev_gap_closed"] = 100 * (t["solar-only"] - t) / (t["solar-only"] - t["oracle (EV only)"])
     return m[[c for c in METRICS if c in m]]
 
 
-def aggregate(name, seeds, out_root):
+def aggregate(name, seeds, out_root, table="test"):
     rows, curves, scripted = [], {}, None
+    label = name if table == "test" else f"{name}_{table.removeprefix('test_')}"
     for s in seeds:
         out = out_root / f"s{s}"
-        test = out / f"{name}_test_continuous.csv"
+        test = out / f"{name}_{table}_continuous.csv"
         if not test.exists():
             print(f"seed {s}: no test table, left out of the aggregate")
             continue
@@ -78,7 +87,7 @@ def aggregate(name, seeds, out_root):
         rows.append(m.loc[learned].reset_index().assign(seed=s))
         scripted = m.drop(index=learned) if scripted is None else scripted
         log = out / f"{name}_log.csv"
-        if log.exists():
+        if log.exists() and table == "test":
             curves[s] = pd.read_csv(log).set_index("step")["validation_return"]
     if not rows:
         raise SystemExit("no finished seeds to aggregate")
@@ -93,6 +102,7 @@ def aggregate(name, seeds, out_root):
     summary = pd.concat([stats, base])
 
     res = ROOT / "results" / "seeds"; res.mkdir(parents=True, exist_ok=True)
+    name = label
     per_seed.to_csv(res / f"{name}_per_seed.csv", index=False)
     flat = summary.copy()
     flat.columns = [f"{a}_{b}" if b else a for a, b in flat.columns]
@@ -103,11 +113,12 @@ def aggregate(name, seeds, out_root):
     for policy, r in stats.iterrows():
         f = lambda k, unit="": f"{r[(k, 'mean')]:7.2f} ± {r[(k, 'std')]:.2f}{unit}"
         print(f"{policy:<20} cost {f('total')}   vs solar-only {f('vs_solar_only')}   vs best heuristic {f('vs_best_heuristic')}   value share {f('value_share', ' %')}"
-              f"   gap closed {f('gap_closed', ' %')}   exported from battery {f('discharged_to_export_kwh', ' kWh')}")
+              f"   gap closed {f('gap_closed', ' %')}   exported from battery {f('discharged_to_export_kwh', ' kWh')}"
+              + (f"   EV gap closed {f('ev_gap_closed', ' %')}   EV public {f('ev_public_kwh', ' kWh')}" if ("ev_gap_closed", "mean") in r else ""))
     print("\nper seed (cost):")
     print(per_seed.pivot(index="seed", columns="policy", values="total").round(2).to_string())
     print("\nscripted baselines (deterministic):")
-    print(scripted[["total", "vs_solar_only", "vs_best_heuristic", "value_share", "gap_closed"]].round(2).to_string())
+    print(scripted[[c for c in ("total", "vs_solar_only", "vs_best_heuristic", "value_share", "gap_closed", "ev_gap_closed") if c in scripted]].round(2).to_string())
 
     if curves:
         c = pd.DataFrame(curves).sort_index()
@@ -150,3 +161,5 @@ if __name__ == "__main__":
         if any(codes):
             print(f"{sum(c != 0 for c in codes)} seed(s) failed; aggregating the rest")
     aggregate(args.name, seeds, out_root)
+    if any((out_root / f"s{s}" / f"{args.name}_test_ood_continuous.csv").exists() for s in seeds):
+        aggregate(args.name, seeds, out_root, table="test_ood")

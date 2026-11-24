@@ -1,0 +1,24 @@
+# The microgrid environment for sheeprl (found through `--config-dir configs/sheeprl`, see dreamer.py).
+# The training env: train split, TrainingReward (saving vs idle battery + clip penalty), as for SAC.
+defaults:
+  - default
+  - _self_
+
+id: microgrid_${env.wrapper.household}
+num_envs: 4
+sync_env: True          # the env is cheap to step; no subprocesses
+capture_video: False
+action_repeat: 1
+max_episode_steps: null # the env truncates its own one-week episodes (never terminates: continuing task)
+
+wrapper:
+  _target_: dreamer.make_microgrid
+  household: ev_hp
+  split: train
+  action_mode: power
+  control: full          # ev: wallbox only, battery on the solar-only rule
+  clip_penalty: 0.05
+  ev_shaping: False
+  houses: fixed          # gen: one random house of the split's house set per episode (houses.py)
+  context: observed      # with houses=gen: car and house parameters in the obs (observed) or not (hidden)
+  gamma: ${algo.gamma}  # the shaping's discount must be the agent's own for policy invariance
